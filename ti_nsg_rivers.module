@@ -1,0 +1,17 @@
+<?php
+
+/**
+ * @file
+ *
+ * (New) NSG Rivers Module
+ *
+ * Creates an endlessly-flowing river of content with configurable tiles and
+ * tile containers.
+ *
+ * @author H.H.(SI)
+ */
+
+require_once 'loader.php';
+
+use Timeinc\NSG\Rivers\loader as load;
+

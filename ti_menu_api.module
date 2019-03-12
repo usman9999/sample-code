@@ -1,0 +1,397 @@
+<?php
+
+/**
+ * @file
+ * Menu API.
+ *
+ * Exposes selected Drupal menus to the Content API.
+ *
+ * @author Matt Panton
+ */
+
+/**
+ * Implements hook_menu_link_alter().
+ */
+function ti_menu_api_menu_link_alter(&$item) {
+  global $language;
+  $cid = '_ti_menu_api:' . $item['menu_name'] . ':tree-data:' . $language->language;
+  cache_clear_all($cid, 'cache');
+}
+
+/**
+ * Helper function to route the menu API request.
+ *
+ * @detail Each menu requested is cached
+ * separately until that menu has been updated.
+ *
+ * @return array $menu_names
+ *   Return the fully complied menu for
+ *   the Content API.
+ */
+function ti_menu_api_route() {
+  global $language;
+  $lang = ($language->language !== 'en') ? '_' . $language->language : '';
+
+  $data_sources = array(
+    'ribbon' => 'mm_components_nav_ribbon',
+    'menu' => 'mm_components_nav_primary',
+    'second-menu' => 'mm_components_nav_second_primary',
+    'subscribe_text' => 'mm_components_subscribe_text',
+    'subscribe' => 'mm_components_subscribe_link',
+    'subscribe_mobile' => 'mm_components_subscribe_link_mobile',
+    'subscribe_cover_image' => 'mm_components_subscribe_cover_image',
+    'subscribe_extra_class' => 'mm_components_subscribe_extra_classes',
+    'footer' => 'mm_components_nav_footer',
+    'social' => 'mm_components_nav_social',
+    'legal' => 'mm_components_legal_copy',
+  );
+
+  foreach ($data_sources as $key => $data) {
+    $menu_names[$key] = variable_get($data . $lang);
+  }
+
+  return ti_menu_api_process_menu($menu_names);
+}
+
+/**
+ * Helper function to output the JSON for the menu.
+ *
+ * @detail Each menu requested is cached
+ * separately until that menu has been updated.
+ * A request for one or more menus can be made.
+ *
+ * TODO: The menu structure in MM is inconsistent,
+ * we should clean it up and simplify the function below
+ * to accommodate the unnecessarily complex data structure
+ * because it's differently keyed and nested for each menu.
+ *
+ * @param array $data_sources
+ *   The type of menu (ex. ribbon or primary menu).
+ *
+ * @return array $structure
+ *   Return the menu structure to be included
+ *   with the Content API.
+ */
+function ti_menu_api_process_menu(array $data_sources) {
+  $structure = array();
+
+  // Since each type of menu has its data structured differently
+  // we accommodate the different keying and nesting here.
+  foreach ($data_sources as $key => $data) {
+    switch ($key) {
+      case 'ribbon':
+        $data_sources[$key] = array(
+          'primary' => _ti_menu_api_menu_query($data),
+        );
+        break;
+
+      case 'menu':
+        $data_sources[$key] = array(
+          array(
+            'type' => 'main-menu',
+            'menu' => _ti_menu_api_menu_query($data),
+          ),
+        );
+        break;
+
+      case 'second-menu':
+        $data_sources[$key] = array(
+          array(
+            'type' => 'second-menu',
+            'menu' => _ti_menu_api_menu_query($data),
+          ),
+        );
+        break;
+
+      case 'footer':
+        $data_sources[$key] = array(
+          'links' => _ti_menu_api_menu_query($data, 'links'),
+          'legal' => $data_sources['legal'],
+          'social' => _ti_menu_api_process_social_media($data_sources['social']),
+        );
+        unset($data_sources['social']);
+        unset($data_sources['legal']);
+        break;
+
+      default:
+        if (empty($data_sources[$key])) {
+          unset($data_sources[$key]);
+        }
+        break;
+    }
+  }
+
+  // Add the second main menu (fly-out menu)
+  // to the data array for it.
+  if (!empty($data_sources['second-menu']) && !empty($data_sources['menu'])) {
+    $data_sources['menu'][1] = $data_sources['second-menu'][0];
+    unset($data_sources['second-menu']);
+  }
+
+  // Use the primary menu (without the secondary menu)
+  // for the ribbon menu if it's not selected.
+  if (empty($data_sources['ribbon']['primary'])) {
+    $data_sources['ribbon']['primary'] = $data_sources['menu'][0]['menu'];
+  }
+
+  // Append the subscribe href to the ribbon menu.
+  // This includes a desktop and mobile version
+  // along with a cover image.
+  if (!empty($data_sources['subscribe']) && !empty($data_sources['subscribe_mobile'])) {
+    $data_sources['ribbon']['primary'] = array_merge($data_sources['ribbon']['primary'], array(
+      array(
+        'type' => 'subscribe-flyout',
+        'extra_class' => 'component subscribe-flyout ',
+        'decoration' => $data_sources['subscribe_extra_class'],
+        'data' => array(
+          'label' => $data_sources['subscribe_text'] ? $data_sources['subscribe_text'] : 'Subscribe',
+          'href' => $data_sources['subscribe'],
+          'cover' => !empty($data_sources['subscribe_cover_image']) ? $data_sources['subscribe_cover_image'] : '',
+        ),
+        'data_mobile' => array(
+          'label' => $data_sources['subscribe_text'] ? $data_sources['subscribe_text'] : 'Subscribe',
+          'href' => $data_sources['subscribe_mobile'],
+        ),
+      ),
+    ));
+    unset($data_sources['subscribe']);
+    unset($data_sources['subscribe_mobile']);
+    unset($data_sources['subscribe_cover_image']);
+  }
+
+  // Append the secondary menu to the primary menu.
+  if (isset($data_sources['secondary']) && !empty($data_sources['secondary'])) {
+    $data_sources['menu'][0]['menu'] = array_merge($data_sources['menu'][0]['menu'], $data_sources['secondary']);
+    unset($data_sources['secondary']);
+  }
+
+  if (!empty($data_sources)) {
+    $structure = $data_sources;
+  }
+
+  return $structure;
+}
+
+/**
+ * Query function for `menu_links`.
+ *
+ * @detail We do a straight db query
+ * for the menu and start with a flat
+ * array that contains the depth
+ * and p values for the menu hierarchy.
+ *
+ * @param string $menu_name
+ *   The machine name of the menu.
+ * @param string $submenu_key
+ *   The array key of the submenu.
+ *
+ * @return array $trees
+ *   Return the menu tree.
+ */
+function _ti_menu_api_menu_query($menu_name, $submenu_key = 'submenu') {
+  global $language;
+  $menu_items = array();
+
+  $trees = &drupal_static(__FUNCTION__, array());
+
+  $cid = '_ti_menu_api:' . $menu_name . ':tree-data:' . $language->language;
+
+  if (!isset($trees[$cid])) {
+    $cache = cache_get($cid, 'cache');
+    if ($cache && isset($cache->data)) {
+      $trees[$cid] = $cache->data;
+    }
+  }
+
+  if (!isset($trees[$cid])) {
+    $query = db_select('menu_links', 'ml', array('fetch' => PDO::FETCH_ASSOC));
+
+    $query->fields('ml', array(
+      'plid',
+      'mlid',
+      'link_path',
+      'link_title',
+      'depth',
+      'weight',
+      'router_path',
+      'options',
+    ));
+
+    for ($i = 1; $i <= MENU_MAX_DEPTH; $i++) {
+      $query->orderBy('p' . $i, 'ASC');
+    }
+
+    $query->condition('ml.hidden', 0, '=');
+
+    $query->condition('ml.menu_name', $menu_name);
+
+    foreach ($query->execute() as $item) {
+      $item['options'] = unserialize($item['options']);
+      if (empty($item['link_path'] = _ti_menu_api_parse_url($item['link_path']))) {
+        continue;
+      }
+      $item['link_title'] = _ti_menu_api_process_text($item['link_title']);
+      $menu_items[] = $item;
+    }
+
+    $menu_items = array_reverse($menu_items);
+
+    $data = _ti_menu_api_menu_tree_data($menu_items, 1, $submenu_key);
+
+    cache_set($cid, $data, 'cache');
+    $trees[$cid] = $data;
+  }
+  return $trees[$cid];
+}
+
+/**
+ * Helper function to build the menu array structure.
+ *
+ * @detail Processes the flat array
+ * and recursively builds
+ * a multidimensional array
+ * based on the depth of menu item
+ * along with sorting by its weight.
+ *
+ * @param array $menu_items
+ *   Flat array of menu items.
+ * @param int $depth
+ *   The depth of the menu items.
+ * @param string $submenu_key
+ *   The array key of the submenu.
+ *
+ * @return array
+ *  A multidimensional array of menu items.
+ */
+function _ti_menu_api_menu_tree_data(&$menu_items, $depth = 1, $submenu_key) {
+  $tree = array();
+  while ($item = array_pop($menu_items)) {
+    // Add the current menu item to the tree
+    // with the weight added to it for sorting.
+
+    $tree[($item['weight'] + 5000) . ' ' . $item['mlid']] = array(
+      'label' => $item['link_title'],
+      'href' => $item['link_path'],
+      'new_tab' => (isset($item['options']['attributes']['target']) && $item['options']['attributes']['target'] == '_blank') ? TRUE : FALSE,
+      'decoration' => is_array($item['options']['attributes']['class'])? $item['options']['attributes']['class'][0]: $item['options']['attributes']['class'],
+    );
+    // Look ahead to the next menu item, but leave it on the array so it's available
+    // to other recursive function calls if we return or build a sub-tree.
+    $next = end($menu_items);
+    // Check whether the next menu item is the first in a new sub-tree.
+    if ($next && $next['depth'] > $depth) {
+      // Recursively call _ti_menu_api_menu_tree_data to build the sub-tree.
+      $tree[($item['weight'] + 5000) . ' ' . $item['mlid']][$submenu_key] = _ti_menu_api_menu_tree_data($menu_items, $next['depth']);
+      // Fetch next link after filling the sub-tree.
+      $next = end($menu_items);
+    }
+    // Determine if we should exit the loop and return.
+    if (!$next || $next['depth'] < $depth) {
+      break;
+    }
+  }
+
+  // Sort the array by the weight of the items.
+  ksort($tree);
+
+  $tree = array_values($tree);
+
+  return $tree;
+}
+
+/**
+ * Helper function to process social media data.
+ *
+ * @param array $data
+ *   The piped data.
+ *
+ * @return array
+ *   Array of social media icons.
+ */
+function _ti_menu_api_process_social_media($data) {
+  $social_icons = array();
+  $social_items = _ti_menu_api_process_piped_data($data, array('type', 'url'));
+  foreach ($social_items as $item) {
+    $item['type'] = ($item['type'] == 'googleplus') ? 'google' : $item['type'];
+    $social_icons[] = array(
+      'icon' => $item['type'] . '-circle-stroke',
+      'url' => $item['url'],
+      'color' => 'accent',
+      'extras' => 'margin-4-right',
+    );
+  }
+  return $social_icons;
+}
+
+/**
+ * Helper function to process piped data.
+ *
+ * @detail Loops through
+ * and builds an array from piped
+ * data based on the keys supplied.
+ *
+ * @param array $data
+ *   The piped data.
+ * @param array $keys
+ *   The keys to assign to the array.
+ *
+ * @return array
+ *   The combined data.
+ */
+function _ti_menu_api_process_piped_data($data, $keys = array('label', 'href')) {
+  $split_data = explode("\n", $data);
+  foreach ($split_data as $idx => $item) {
+    $item = explode('|', $item);
+    $item = array_map('trim', $item);
+    $combined_data[] = array_combine($keys, $item);
+  }
+  return $combined_data;
+}
+
+/**
+ * Helper function to validate an alias.
+ *
+ * @param string $alias
+ *   The alias to parse.
+ *
+ * @return string
+ *   The parsed alias.
+ */
+function _ti_menu_api_parse_url($alias) {
+  global $base_insecure_url;
+
+  if (!drupal_valid_path($alias)) {
+    return '';
+  }
+
+  $alias = drupal_get_path_alias($alias);
+
+  if ($alias == '<front>') {
+    $alias = $base_insecure_url;
+  }
+
+  if (!url_is_external($alias) && strpos($alias, '/') !== 0) {
+    $alias = '/' . $alias;
+  }
+
+  return $alias;
+}
+
+/**
+ * Helper function to process text.
+ *
+ * @detail Process the menu item
+ * label to remove
+ * whitespace and HTML tags.
+ *
+ * @param string $text
+ *   The text to process.
+ *
+ * @return string
+ * The processed text.
+ */
+function _ti_menu_api_process_text($text) {
+  $text = strip_tags(html_entity_decode($text));
+  $text = trim($text, " \t\n\r\0\x0B\xC2\xA0");
+  return $text;
+}
